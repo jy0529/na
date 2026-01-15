@@ -1,8 +1,10 @@
 # ReAct Pattern
 
 from llm import OpenAIClient, LLMSettings
+from llm.tools import get_tool_registry
 from typing import Dict, Any, List, Optional, AsyncIterator
 import asyncio
+import json
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -11,9 +13,9 @@ from dataclasses import dataclass
 class ReActConfig:
     """ReAct 配置"""
     thinking_model: str = "deepseek/deepseek-v3.2"
-    action_model: str = "xiaomi/mimo-v2-flash:free"
+    action_model: str = "google/gemini-2.0-flash-001"
     continue_model: str = "deepseek/deepseek-v3.2"
-    synthesis_model: str = "xiaomi/mimo-v2-flash:free"
+    synthesis_model: str = "google/gemini-2.0-flash-001"
     temperature: float = 0.3
     min_iterations: int = 1
     max_iterations: int = 5
@@ -48,6 +50,143 @@ async def extract_stream_content(
             print(f"\n❌ Error extracting stream content: {e}")
         raise
     return content
+
+
+async def extract_and_execute_tools(
+    stream: AsyncIterator[Any],
+    print_output: bool = True
+) -> str:
+    """
+    从流式响应中提取工具调用并执行
+    
+    Args:
+        stream: 异步生成器流
+        print_output: 是否打印输出
+        
+    Returns:
+        工具执行结果或文本内容
+    """
+    content = ""
+    tool_calls = {}  # {index: {"name": "", "arguments": ""}}
+    registry = get_tool_registry()
+    
+    try:
+        async for chunk in stream:
+            if hasattr(chunk, 'choices') and chunk.choices:
+                delta = chunk.choices[0].delta
+                
+                # 提取文本内容
+                if hasattr(delta, 'content') and delta.content:
+                    text = delta.content
+                    if print_output:
+                        print(text, end='', flush=True)
+                    content += text
+                
+                # 提取工具调用
+                if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                    for tool_call_delta in delta.tool_calls:
+                        index = tool_call_delta.index
+                        
+                        if index not in tool_calls:
+                            tool_calls[index] = {
+                                "id": "",
+                                "name": "",
+                                "arguments": ""
+                            }
+                        
+                        # 累积工具调用 ID
+                        if hasattr(tool_call_delta, 'id') and tool_call_delta.id:
+                            tool_calls[index]["id"] = tool_call_delta.id
+                        
+                        # 累积函数名称
+                        if hasattr(tool_call_delta, 'function'):
+                            if hasattr(tool_call_delta.function, 'name') and tool_call_delta.function.name:
+                                tool_calls[index]["name"] = tool_call_delta.function.name
+                            
+                            # 累积函数参数（可能是部分 JSON）
+                            if hasattr(tool_call_delta.function, 'arguments') and tool_call_delta.function.arguments:
+                                tool_calls[index]["arguments"] += tool_call_delta.function.arguments
+        
+        # 如果有工具调用，执行它们
+        if tool_calls:
+            if print_output:
+                print(f"\n\n🔧 [TOOL CALLS] Found {len(tool_calls)} tool call(s)")
+            
+            tool_results = []
+            for index, tool_call in tool_calls.items():
+                tool_name = tool_call["name"]
+                arguments_str = tool_call["arguments"]
+                
+                if not tool_name:
+                    continue
+                
+                try:
+                    # 解析参数（流式响应中的 JSON 可能是分块的）
+                    if arguments_str:
+                        try:
+                            arguments = json.loads(arguments_str)
+                        except json.JSONDecodeError:
+                            # 如果 JSON 不完整，尝试修复（添加缺失的闭合括号）
+                            try:
+                                # 尝试添加缺失的闭合括号
+                                open_braces = arguments_str.count('{')
+                                close_braces = arguments_str.count('}')
+                                missing = open_braces - close_braces
+                                if missing > 0:
+                                    arguments = json.loads(arguments_str + '}' * missing)
+                                else:
+                                    arguments = {}
+                            except json.JSONDecodeError:
+                                # 如果还是失败，使用空字典
+                                arguments = {}
+                    else:
+                        arguments = {}
+                    
+                    if print_output:
+                        print(f"\n  📞 Calling tool: {tool_name}")
+                        print(f"     Arguments: {json.dumps(arguments, indent=2, ensure_ascii=False)}")
+                    
+                    # 获取并执行工具
+                    tool = registry.get_tool(tool_name)
+                    result = await tool.execute(**arguments)
+                    
+                    if result.success:
+                        result_str = json.dumps(result.output, indent=2, ensure_ascii=False, default=str)
+                        if print_output:
+                            print(f"  ✅ Tool result: {result_str[:200]}..." if len(result_str) > 200 else f"  ✅ Tool result: {result_str}")
+                        tool_results.append({
+                            "tool": tool_name,
+                            "result": result.output
+                        })
+                    else:
+                        error_msg = f"Tool {tool_name} failed: {result.error}"
+                        if print_output:
+                            print(f"  ❌ {error_msg}")
+                        tool_results.append({
+                            "tool": tool_name,
+                            "error": result.error
+                        })
+                        
+                except Exception as e:
+                    error_msg = f"Error executing tool {tool_name}: {str(e)}"
+                    if print_output:
+                        print(f"  ❌ {error_msg}")
+                    tool_results.append({
+                        "tool": tool_name,
+                        "error": str(e)
+                    })
+            
+            # 返回工具执行结果
+            if tool_results:
+                return json.dumps(tool_results, indent=2, ensure_ascii=False, default=str)
+        
+        # 如果没有工具调用，返回文本内容
+        return content
+        
+    except Exception as e:
+        if print_output:
+            print(f"\n❌ Error extracting stream content: {e}")
+        raise
 
 
 async def think_phase(
@@ -151,6 +290,8 @@ async def act_phase(
         Previous observations: {observations_text}
         """
     
+    tools = get_tool_registry().to_openai_tools()
+    
     try:
         action_stream = llm_client.stream_chat(
             model=config.action_model,
@@ -164,9 +305,11 @@ async def act_phase(
                     "role": "user",
                     "content": f"User query: {user_query}"
                 }
-            ]
+            ],
+            tools=tools,
         )
-        observation_content = await extract_stream_content(action_stream)
+        # 提取工具调用并执行
+        observation_content = await extract_and_execute_tools(action_stream)
         print(f"\n{'='*60}")
         print("✅ [ACTION PHASE] Completed")
         print(f"{'='*60}\n")

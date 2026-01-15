@@ -36,7 +36,14 @@ class OpenAIClient(LLMClient):
             **kwargs
         )
 
-        return response.choices[0].message
+        if not response.choices or len(response.choices) == 0:
+            raise ValueError("No choices in response")
+        
+        message = response.choices[0].message
+        if not message:
+            raise ValueError("No message in response")
+        
+        return message
 
         
     async def stream_chat(
